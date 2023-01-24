@@ -99,7 +99,7 @@ pub mod pallet {
 		executor::{cosmwasm_call, QueryCall, QueryResponse},
 		system::{cosmwasm_system_query, CosmwasmCodeId, CosmwasmContractMeta},
 	};
-	use cosmwasm_vm_wasmi::{host_functions, new_wasmi_vm, WasmiImportResolver, WasmiVM};
+	use cosmwasm_vm_wasmi::{new_wasmi_vm, OwnedWasmiVM, WasmiVM};
 	use frame_support::{
 		dispatch::{DispatchErrorWithPostInfo, DispatchResultWithPostInfo, PostDispatchInfo},
 		pallet_prelude::*,
@@ -163,7 +163,12 @@ pub mod pallet {
 	}
 
 	#[pallet::config]
-	pub trait Config: frame_system::Config<AccountId = AccountIdOf<Self>> + Debug {
+	pub trait Config:
+		frame_system::Config<AccountId = AccountIdOf<Self>>
+		+ Debug
+		+ core::marker::Send
+		+ core::marker::Sync
+	{
 		#[allow(missing_docs)]
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
@@ -563,7 +568,7 @@ pub mod pallet {
 		) -> Result<(), CosmwasmVMError<T>>
 		where
 			F: for<'x> FnOnce(
-				&'x mut WasmiVM<DefaultCosmwasmVM<'x, T>>,
+				OwnedWasmiVM<DefaultCosmwasmVM<'x, T>>,
 			) -> Result<
 				(Option<CosmwasmBinary>, Vec<CosmwasmEvent>),
 				CosmwasmVMError<T>,
@@ -606,11 +611,11 @@ pub mod pallet {
 		) -> Result<R, CosmwasmVMError<T>>
 		where
 			F: for<'x> FnOnce(
-				&'x mut WasmiVM<DefaultCosmwasmVM<'x, T>>,
+				OwnedWasmiVM<DefaultCosmwasmVM<'x, T>>,
 			) -> Result<R, CosmwasmVMError<T>>,
 		{
-			let mut vm = Self::cosmwasm_new_vm(shared, sender, contract, funds)?;
-			call(&mut vm)
+			let vm = Self::cosmwasm_new_vm(shared, sender, contract, funds)?;
+			call(vm)
 		}
 
 		/// Refund the remaining gas regardless of a contract outcome.
@@ -905,15 +910,21 @@ pub mod pallet {
 			contract: AccountIdOf<T>,
 			new_admin: Option<AccountIdOf<T>>,
 		) -> Result<(), CosmwasmVMError<T>> {
-			Self::cosmwasm_call(shared, who.clone(), contract.clone(), Default::default(), |vm| {
-				cosmwasm_vm::system::update_admin(
-					vm,
-					&Addr::unchecked(Self::account_to_cosmwasm_addr(who)),
-					CosmwasmAccount::new(contract),
-					new_admin.map(CosmwasmAccount::new),
-				)
-				.map_err(Into::into)
-			})
+			Self::cosmwasm_call(
+				shared,
+				who.clone(),
+				contract.clone(),
+				Default::default(),
+				|mut vm| {
+					cosmwasm_vm::system::update_admin(
+						&mut vm,
+						&Addr::unchecked(Self::account_to_cosmwasm_addr(who)),
+						CosmwasmAccount::new(contract),
+						new_admin.map(CosmwasmAccount::new),
+					)
+					.map_err(Into::into)
+				},
+			)
 		}
 
 		fn block_env() -> BlockInfo {
@@ -976,7 +987,7 @@ pub mod pallet {
 			sender: AccountIdOf<T>,
 			contract: AccountIdOf<T>,
 			funds: Vec<Coin>,
-		) -> Result<WasmiVM<DefaultCosmwasmVM<'a, T>>, CosmwasmVMError<T>> {
+		) -> Result<OwnedWasmiVM<DefaultCosmwasmVM<'a, T>>, CosmwasmVMError<T>> {
 			shared.depth = shared.depth.checked_add(1).ok_or(Error::<T>::VMDepthOverflow)?;
 			ensure!(shared.depth <= T::MaxFrames::get(), Error::<T>::StackOverflow);
 
@@ -990,16 +1001,22 @@ pub mod pallet {
 			};
 
 			match T::PalletHook::info(&contract) {
-				Some(precompiled_info) => Ok(WasmiVM(CosmwasmVM {
-					host_functions_by_index: Default::default(),
-					cosmwasm_env: env,
-					cosmwasm_message_info: message_info,
-					contract_address: cosmwasm_contract_address,
-					contract_info: precompiled_info.contract,
-					shared,
-					iterators: Default::default(),
-					contract_runtime: ContractBackend::Pallet,
-				})),
+				Some(precompiled_info) => {
+					let engine = wasmi::Engine::default();
+					let store = wasmi::Store::new(
+						&engine,
+						CosmwasmVM {
+							cosmwasm_env: env,
+							cosmwasm_message_info: message_info,
+							contract_address: cosmwasm_contract_address,
+							contract_info: precompiled_info.contract,
+							shared,
+							iterators: Default::default(),
+							contract_runtime: ContractBackend::Pallet,
+						},
+					);
+					Ok(WasmiVM(store))
+				},
 				None => {
 					let info = Self::contract_info(&contract)?;
 					let code = match shared.cache.code.entry(info.code_id) {
@@ -1018,27 +1035,20 @@ pub mod pallet {
 							o.into_mut()
 						},
 					};
-					let host_functions_definitions = WasmiImportResolver(
-						host_functions::definitions::<DefaultCosmwasmVM<'a, T>>(),
-					);
-					let module = new_wasmi_vm(&host_functions_definitions, code)
-						.map_err(|_| Error::<T>::VmCreation)?;
+					let code: Vec<u8> = code.clone();
 					log::debug!(target: "runtime::contracts", "env  : {:#?}", env);
 					log::debug!(target: "runtime::contracts", "info : {:#?}", message_info);
-					Ok(WasmiVM(CosmwasmVM {
-						host_functions_by_index: host_functions_definitions
-							.0
-							.into_iter()
-							.flat_map(|(_, modules)| modules.into_values())
-							.collect(),
+					let vm = CosmwasmVM {
 						cosmwasm_env: env,
 						cosmwasm_message_info: message_info,
 						contract_address: cosmwasm_contract_address,
 						contract_info: info,
 						shared,
 						iterators: Default::default(),
-						contract_runtime: ContractBackend::CosmWasm { executing_module: module },
-					}))
+						contract_runtime: ContractBackend::CosmWasm { executing_module: None },
+					};
+					let wasmi_vm = new_wasmi_vm(&code, vm).map_err(|_| Error::<T>::VmCreation)?;
+					Ok(wasmi_vm)
 				},
 			}
 		}
@@ -1482,15 +1492,20 @@ pub mod pallet {
 		) -> Result<cosmwasm_vm::executor::QueryResult, CosmwasmVMError<T>> {
 			let sender = vm.contract_address.clone().into_inner();
 			vm.shared.push_readonly();
-			let result =
-				Pallet::<T>::cosmwasm_call(vm.shared, sender, contract, Default::default(), |vm| {
-					match vm.0.contract_runtime {
-						ContractBackend::CosmWasm { .. } =>
-							cosmwasm_call::<QueryCall, WasmiVM<DefaultCosmwasmVM<T>>>(vm, message),
-						ContractBackend::Pallet =>
-							T::PalletHook::query(vm, message).map(Into::into),
-					}
-				});
+			let result = Pallet::<T>::cosmwasm_call(
+				vm.shared,
+				sender,
+				contract,
+				Default::default(),
+				|mut vm| match vm.0.data_mut().contract_runtime {
+					ContractBackend::CosmWasm { .. } => cosmwasm_call::<
+						QueryCall,
+						OwnedWasmiVM<DefaultCosmwasmVM<T>>,
+					>(&mut vm, message),
+					ContractBackend::Pallet =>
+						T::PalletHook::query(&mut vm, message).map(Into::into),
+				},
+			);
 			vm.shared.pop_readonly();
 			result
 		}
@@ -1524,8 +1539,8 @@ pub mod pallet {
 			contract.clone(),
 			contract,
 			Default::default(),
-			|vm| {
-				cosmwasm_system_query(vm, query_request)?
+			|mut vm| {
+				cosmwasm_system_query(&mut vm, query_request)?
 					.into_result()
 					.map_err(|e| CosmwasmVMError::Rpc(format!("{:?}", e)))?
 					.into_result()

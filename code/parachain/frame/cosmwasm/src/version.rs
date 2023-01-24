@@ -9,7 +9,6 @@ use cosmwasm_vm::{
 		AllocateCall, AsFunctionName, DeallocateCall, ExecuteCall, InstantiateCall, MigrateCall,
 		QueryCall, ReplyCall,
 	},
-	memory::PointerOf,
 	vm::VmMessageCustomOf,
 };
 
@@ -39,13 +38,13 @@ impl<T: Config> Version<T> {
 		// Memory related exports.
 		(
 			ExportRequirement::Mandatory,
-			AllocateCall::<PointerOf<DefaultCosmwasmVM<T>>>::NAME,
+			AllocateCall::<()>::NAME,
 			// extern "C" fn allocate(size: usize) -> u32;
 			&[parity_wasm::elements::ValueType::I32],
 		),
 		(
 			ExportRequirement::Mandatory,
-			DeallocateCall::<PointerOf<DefaultCosmwasmVM<T>>>::NAME,
+			DeallocateCall::<()>::NAME,
 			// extern "C" fn deallocate(pointer: u32);
 			&[parity_wasm::elements::ValueType::I32],
 		),
